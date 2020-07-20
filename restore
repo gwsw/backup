@@ -1,0 +1,137 @@
+#! /usr/bin/perl
+use strict;
+use Cwd 'abs_path';
+use File::Path;
+use IO::Compress::Gzip;
+
+my $usage =
+    "usage: restore [-n] [-f] [-v]... backup_dir [-x exclude]... [dest]\n" .
+    "       backup_dir and dest must be absolute paths\n" .
+    "       exclude is a directory name relative to backup_dir\n" .
+    "   eg. restore /media/sf_backup/home/markn/src/less-481 less-481.restored\n" .
+    "   or. restore /media/sf_backup/home/markn /home/markn.new\n";
+
+my $verbose = 0;
+my $dryrun = 0;
+my $force = 0;
+
+exit (main() ? 0 : 1);
+
+# --------------------------------------------------------------------
+sub main {
+    my $args = parse(@ARGV);
+    die $usage if not $args;
+
+    $$args{dest} = '.' if not $$args{dest};
+    print "START  ", $0, " ", scalar gmtime(), "\n" if $verbose;
+    my $ok = restore($$args{backup_dir}, $$args{dest}, $$args{excludes});
+    print "END    ", $0, " ", scalar gmtime(), "\n" if $verbose;
+    return $ok;
+}
+
+# --------------------------------------------------------------------
+sub restore {
+    my ($backup_dir, $dest_dir, $excludes) = @_;
+    print "RESTOR $backup_dir to $dest_dir\n" if $verbose;
+    my $ok = 1;
+    my $latest_version = 0;
+    my $curr_file;
+    # List all backup files, choose the latest version of each.
+    my $find = "find ".quote($backup_dir);
+    foreach my $exclude (@$excludes) {
+        $find .= " -path ".quote($exclude)." -type d -prune -o";
+    }
+    $find .= " -regex '.*/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' -print | sed ".quote('s|^'.$backup_dir.'/*||');
+    if (not open FILES, "$find|") {
+        print "ERROR  cannot execute \"$find\": $!\n";
+        $ok = 0;
+    } else {
+        while (<FILES>) {
+            chomp;
+            my ($file, $version) = m|^(.*)\/([^/]+)/*$|;
+            next if not $file or not $version;
+            if (defined $curr_file and $file ne $curr_file) {
+                # This is a new file. We've seen all versions of
+                # the previous file so restore the best one.
+                $ok = 0 if not 
+                    restore_file($backup_dir, $dest_dir, $curr_file, $latest_version);
+                $latest_version = 0;
+            }
+            $latest_version = $version if $version > $latest_version;
+            $curr_file = $file;
+        }
+        # Restore the final file.
+        $ok = 0 if $latest_version and not 
+            restore_file($backup_dir, $dest_dir, $curr_file, $latest_version);
+        close FILES
+    }
+    print "DONE   $backup_dir to $dest_dir\n" if $verbose;
+    return $ok;
+}
+
+# --------------------------------------------------------------------
+sub restore_file {
+    my ($backup_dir, $dest_dir, $file, $version) = @_;
+    my $backup_file = "$backup_dir/$file/$version";
+    my $dest_file = "$dest_dir/$file";
+    $dest_file =~ s/%(..)/chr(hex($1))/gex;
+    if (not $force and -r $dest_file) {
+        print "SKIP   $dest_file\n" if $verbose > 1;
+        return 1;
+    }
+    print "UNZIP  $dest_file\n" if $verbose == 1;
+    my $dest_dir = $dest_file;
+    $dest_dir =~ s:/[^/]+$::; # remove the final (file) component
+    my $cmd = "if [ -f ".quote($dest_dir)." ]; then rm -f ".quote($dest_dir)."; fi; mkdir -p ".quote($dest_dir)." && gunzip -c ".quote($backup_file)." > ".quote($dest_file);
+    print "EXEC   $cmd\n" if $verbose > 1;
+    return 1 if $dryrun;
+    return 0 if system($cmd) != 0;
+    my ($dev,$ino,$mode) = stat($backup_file);
+    chmod ($mode & 0777), $dest_file;
+    utime $version, $version, $dest_file;
+}
+
+# --------------------------------------------------------------------
+sub parse {
+    my %args;
+    my @excludes;
+    while (@_) {
+        my $arg = shift @_;
+        if ($arg eq '-x') {
+            push @excludes, (shift @_);
+        } elsif ($arg eq '-?') {
+            return undef;
+        } elsif ($arg eq '-f') {
+            $force = 1;
+        } elsif ($arg eq '-n') {
+            $dryrun = 1;
+        } elsif ($arg eq '-v') {
+            $verbose++;
+        } elsif ($arg eq '-r') {
+            ; # compat: remove
+        } elsif ($arg =~ /^-/) {
+            printf "ERROR  invalid command line option: $arg\n";
+            return undef;
+        } else {
+            if (not defined $args{backup_dir}) {
+                $args{backup_dir} = $arg;
+            } elsif (not defined $args{dest}) {
+                $args{dest} = $arg;
+            } else {
+                print "ERROR  too many arguments\n";
+                return undef;
+            }
+        }
+    }
+    return undef if not $args{dest};
+    $args{excludes} = \@excludes;
+    return \%args;
+}
+
+# --------------------------------------------------------------------
+sub quote {
+    my ($str) = @_;
+    return "'$str'" if $str !~ /'/;
+    print "WARN   cannot quote $str\n" if $str =~ /"/;
+    return "\"$str\"";
+}

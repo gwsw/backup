@@ -1,0 +1,237 @@
+#! /usr/bin/perl
+use strict;
+use Cwd 'abs_path';
+use IO::Compress::Gzip;
+
+my $usage = 
+    "usage: backup [-n] [-vXXX] [-k #] -r backup_root [dir [-x exclude]...]...\n" .
+    "       -n = dry run\n" .
+    "       -k = Keep # backup copies\n" .
+    "       -v = verbose flags: b:backup, f:find, o:ok, c:copy, p:prune, s:summary, A:all\n" .
+    "       backup_root and dir must be absolute paths\n" .
+    "       exclude is a directory name relative to dir\n";
+
+my @dir_infos;
+my $backup_root;
+my $verbose = '';
+my $dry_run = 0;
+my $keep = 3;
+my $stat_check = 0;
+my $stat_copy = 0;
+my $stat_junk = 0;
+my $stat_prune = 0;
+
+exit (main() ? 0 : 1);
+
+# --------------------------------------------------------------------
+# Entry point.
+sub main {
+    die $usage if not parse(@ARGV);
+    my $ok = 1;
+    foreach my $info (@dir_infos) {
+        my $dir = $$info{dir};
+        my $excludes = $$info{excludes};
+        $ok = 0 if not backup($dir, $excludes);
+    }
+    print "$stat_check checked, $stat_copy copied, $stat_prune pruned, $stat_junk junk\n" if verbose('s');
+    return $ok;
+}
+
+# --------------------------------------------------------------------
+# Backup a directory tree.
+sub backup {
+    my ($dir, $excludes) = @_;
+    my $old_dir = Cwd::getcwd();
+    print "BACK  $dir\n" if verbose('b');
+    if (not chdir $dir) {
+        print "ERROR cannot change to \"$dir\": $!\n";
+        return 0;
+    }
+    my $ok = 1;
+    my $find = "find . ";
+    foreach my $exclude (@$excludes) {
+        $find .= " -path ".quote($exclude)." -type d -prune -o";
+    }
+    $find .= " -type f -print";
+    print "FIND  $find\n" if verbose('f');
+    if (not open FILES, "$find|") {
+        print "ERROR cannot execute \"$find\": $!\n";
+        $ok = 0;
+    } else {
+        while (<FILES>) {
+            chomp;
+            $ok = 0 if not backup_file("$dir/$_");
+        }
+        close FILES;
+    }
+    print "DONE  $dir\n" if verbose('b');
+    chdir $old_dir;
+    return $ok;
+}
+
+# --------------------------------------------------------------------
+# Backup a single file.
+sub backup_file {
+    my ($file) = @_;
+    ++$stat_check;
+    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$acctime,$modtime) = stat($file);
+    my $bdir = safe_filename("$backup_root/$file");
+
+    # Get list of files in bdir.
+    my @bfiles;
+    make_path($bdir) if not $dry_run;
+    if (opendir BDIR, $bdir) {
+        @bfiles = sort { $a <=> $b } grep { -f "$bdir/$_" } readdir BDIR;
+        closedir BDIR;
+    } elsif (not $dry_run) {
+        print "ERROR cannot open backup dir \"$bdir\": $!\n";
+        return 0;
+    }
+
+    # Delete any non-backup (eg. tmp) files.
+    for (my $i = 0; $i < @bfiles; $i++) {
+        next if $bfiles[$i] =~ /^\d+$/;
+        ++$stat_junk;
+        my ($f) = splice @bfiles, $i, 1;
+        print "JUNK  $bdir/$f delete\n";
+        unlink "$bdir/$f" unless $dry_run;
+        --$i;
+    }
+
+    # Determine if current version of file is already backed up.
+    my $latest = (@bfiles > 0) ? $bfiles[$#bfiles] : 0;
+    if ($latest and $latest >= $modtime) {
+        print "OK    $file ($modtime) in $bdir/$latest\n" if verbose('o');
+    } else { # No, back it up.
+        print "COPY  $file ($modtime) to $bdir/$modtime\n" if verbose('c');
+        ++$stat_copy;
+        return 0 if not $dry_run and not copy($file, "$bdir/$modtime", $mode & 0777);
+        push @bfiles, $modtime;
+    }
+
+    # If we have more than $keep versions of this file, trim old ones.
+    while (@bfiles > $keep) {
+        my $f = "$bdir/" . shift @bfiles;
+        ++$stat_prune;
+        print "PRUNE $f delete\n" if verbose('p');
+        unlink $f unless $dry_run;
+    }
+    return 1;
+}
+
+# --------------------------------------------------------------------
+# Copy a file (compressed).
+sub copy {
+    my ($from, $to, $mode) = @_;
+    my $f;
+    if (not open $f, $from) {
+        print "ERROR cannot open $from: $!\n";
+        return 0;
+    }
+    my $to_tmp = $to;
+    $to_tmp =~ s:/[^/]+$:/tmp:;
+    unlink $to_tmp;
+    return 0 if not IO::Compress::Gzip::gzip($f => $to_tmp, BinModeIn => 1);
+    close $f;
+    chmod $mode, $to_tmp;
+    return rename $to_tmp, $to;
+}
+
+# --------------------------------------------------------------------
+# Parse command line arguments.
+sub parse {
+    my $dir;
+    my @excludes;
+    while (@_) {
+        my $arg = shift @_;
+        if ($arg eq '-x') {
+            $arg = shift @_;
+            $arg = "./$arg" if $arg !~ /^\.\//;
+            ## $arg .= '/*' if $arg !~ /\/\*$/;
+            push @excludes, $arg;
+        } elsif ($arg eq '-r') {
+            $backup_root = shift @_;
+            return 0 if not absolute($backup_root);
+            if (not -d $backup_root) {
+                print "ERROR root $backup_root does not exist\n";
+                return 0;
+            }
+        } elsif ($arg eq '-k') {
+            $keep = shift @_;
+        } elsif ($arg =~ /^-v(.*)/) {
+            $verbose = $1;
+        } elsif ($arg eq '-n') {
+            $dry_run = 1;
+        } elsif ($arg =~ /^-/) {
+            print "ERROR unknown option $arg\n";
+            return 0;
+        } else {
+            return 0 if not add_dir($dir, @excludes);
+            $dir = $arg;
+            @excludes = ();
+        }
+    }
+    return 0 if not add_dir($dir, @excludes);
+    if (not defined $backup_root) {
+        print "ERROR no backup root specified\n";
+        return 0;
+    }
+    return 1;
+}
+
+# --------------------------------------------------------------------
+# Add a directory to the list of backups.
+sub add_dir {
+    my $dir = shift @_;
+    return 1 if not defined $dir;
+    return 0 if not absolute($dir);
+    my %info;
+    $info{dir} = $dir;
+    my @excludes = @_;
+    $info{excludes} = \@excludes;
+    push @dir_infos, \%info;
+    return 1;
+}
+
+# --------------------------------------------------------------------
+# Is a path absolute?
+sub absolute {
+    my ($path) = @_;
+    return 1 if $path =~ /^\//;
+    print "ERROR $path is not absolute\n";
+    return 0;
+}
+
+# --------------------------------------------------------------------
+sub safe_filename {
+    my ($path) = @_;
+    $path =~ s/%/%25/g;
+    $path =~ s|[^\w/%.-]|"%".hex(ord($&))|ge;
+    return $path;
+}
+
+# --------------------------------------------------------------------
+sub make_path {
+    my ($path) = @_;
+    my $ppath = '';
+    $ppath = '/' if substr($path,0,1) eq '/';
+    foreach my $comp (split /\//, $path) {
+        next if $comp eq '' or $comp eq '.';
+        $ppath .= '/' if length($ppath) > 0 and substr($ppath,-1) ne '/';
+        $ppath .= $comp;
+        mkdir $ppath;
+    }
+}
+
+# --------------------------------------------------------------------
+sub verbose {
+    my ($ch) = @_;
+    return ((index($verbose, $ch) >= 0) or (index($verbose, 'A') >= 0));
+}
+
+# --------------------------------------------------------------------
+sub quote {
+    my ($str) = @_;
+    return "'$str'" if $str !~ /'/;
+    return "\"$str\"";
+}
