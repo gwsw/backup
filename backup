@@ -3,14 +3,16 @@ use strict;
 use Cwd 'abs_path';
 use IO::Compress::Gzip;
 
-my $usage = 
-    "usage: backup [-n] [-vXXX] [-k #] -r backup_root [dir [-x exclude]...]...\n" .
-    "       -n = dry run\n" .
-    "       -k = Keep # backup copies\n" .
-    "       -v = verbose flags: b:backup, f:find, o:ok, c:copy, p:prune, s:summary, A:all\n" .
-    "       backup_root and dir must be absolute paths\n" .
-    "       exclude is a directory name relative to dir\n";
+my $usage = <<_EOF_;
+usage: backup [-n] [-vXXX] [-k #] -r backup_root [dir [-x exclude]...]...
+       -n = dry run
+       -k = Keep # backup copies
+       -v = verbose flags: b:backup, f:find, o:ok, c:copy, p:prune, s:summary, A:all
+       backup_root and dir must be absolute paths
+       exclude is a directory name relative to dir
+_EOF_
 
+# --------------------------------------------------------------------
 my @dir_infos;
 my $backup_root;
 my $verbose = '';
@@ -21,17 +23,14 @@ my $stat_copy = 0;
 my $stat_junk = 0;
 my $stat_prune = 0;
 
-exit (main() ? 0 : 1);
-
 # --------------------------------------------------------------------
 # Entry point.
+exit (main() ? 0 : 1);
 sub main {
     die $usage if not parse(@ARGV);
     my $ok = 1;
     foreach my $info (@dir_infos) {
-        my $dir = $$info{dir};
-        my $excludes = $$info{excludes};
-        $ok = 0 if not backup($dir, $excludes);
+        $ok = 0 if not backup_dir($$info{dir}, $$info{excludes});
     }
     print "$stat_check checked, $stat_copy copied, $stat_prune pruned, $stat_junk junk\n" if verbose('s');
     return $ok;
@@ -39,7 +38,7 @@ sub main {
 
 # --------------------------------------------------------------------
 # Backup a directory tree.
-sub backup {
+sub backup_dir {
     my ($dir, $excludes) = @_;
     my $old_dir = Cwd::getcwd();
     print "BACK  $dir\n" if verbose('b');
@@ -50,7 +49,12 @@ sub backup {
     my $ok = 1;
     my $find = "find . ";
     foreach my $exclude (@$excludes) {
-        $find .= " -path ".quote($exclude)." -type d -prune -o";
+        my $qexclude = quote($exclude);
+        if (not defined $qexclude) {
+            print "ERROR unquotable string: $exclude\n";
+            return 0;
+        }
+        $find .= " -path $qexclude -type d -prune -o";
     }
     $find .= " -type f -print";
     print "FIND  $find\n" if verbose('f');
@@ -149,6 +153,8 @@ sub parse {
             $arg = "./$arg" if $arg !~ /^\.\//;
             ## $arg .= '/*' if $arg !~ /\/\*$/;
             push @excludes, $arg;
+        } elsif ($arg eq '-?') {
+            return 0;
         } elsif ($arg eq '-r') {
             $backup_root = shift @_;
             return 0 if not absolute($backup_root);
@@ -233,5 +239,6 @@ sub verbose {
 sub quote {
     my ($str) = @_;
     return "'$str'" if $str !~ /'/;
-    return "\"$str\"";
+    return "\"$str\"" if $str !~ /"/;
+    return undef;
 }
