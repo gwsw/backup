@@ -212,7 +212,7 @@ sub absolute {
 sub safe_filename {
     my ($path) = @_;
     $path =~ s/%/%25/g;
-    $path =~ s|[^\w/%.-]|"%".hex(ord($&))|ge;
+    $path =~ s|[^\w/%.-]|"%".sprintf('%x',ord($&))|ge;
     return $path;
 }
 
