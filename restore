@@ -5,15 +5,26 @@ use File::Path;
 use IO::Compress::Gzip;
 
 my $usage =
-    "usage: restore [-n] [-f] [-v]... backup_dir [-x exclude]... [dest]\n" .
-    "       backup_dir and dest must be absolute paths\n" .
+    "usage: restore [-n] [-f] [-i] [-v]... backup_dir [-x exclude]... [dest]\n" .
+    "       -n = dry run\n" .
+    "       -f = overwrite existing files\n" .
+    "       -i = interactive shell\n" .
+    "       -v = verbose (may be repeated)\n" .
     "       exclude is a directory name relative to backup_dir\n" .
     "   eg. restore /media/sf_backup/home/markn/src/less-481 less-481.restored\n" .
     "   or. restore /media/sf_backup/home/markn /home/markn.new\n";
 
+my $interactive_help =
+    "ls[-l] [PATH]     List files and directories\n" .
+    "cd PATH           Change working directory\n" .
+    "pwd               Print working directory\n" .
+    "get PATH          Restore file. PATH is relative to backup_dir\n" .
+    "[-+]v             Change verboseness\n";
+
 my $verbose = 0;
 my $dryrun = 0;
 my $force = 0;
+my $interactive = 0;
 
 exit (main() ? 0 : 1);
 
@@ -23,10 +34,101 @@ sub main {
     die $usage if not $args;
 
     $$args{dest} = '.' if not $$args{dest};
+    return interactive($$args{backup_dir}, $$args{dest}) if $interactive;
     print "START  ", $0, " ", scalar gmtime(), "\n" if $verbose;
     my $ok = restore($$args{backup_dir}, $$args{dest}, $$args{excludes});
     print "END    ", $0, " ", scalar gmtime(), "\n" if $verbose;
     return $ok;
+}
+
+# --------------------------------------------------------------------
+sub interactive {
+    my ($backup_dir, $dest_dir) = @_;
+    chdir($backup_dir);
+    print("chdir $backup_dir; now ",Cwd::getcwd(),"\n") if $verbose > 1;
+    my $tty;
+    if (not open $tty, "/dev/tty") {
+        print "cannot open tty: $!\n";
+        return;
+    }
+    for (;;) {
+        print ">";
+        my $line = <$tty>;
+        chomp $line;
+        my ($cmd, $arg) = $line =~ /^\s*([^\s]+)\s*(.*)/;
+        if (not $cmd) {
+            ;
+        } elsif ($cmd eq 'q' or $cmd eq 'quit' or $cmd eq 'exit') {
+            last;
+        } elsif ($cmd eq 'ls' or $cmd eq 'ls-l') {
+            dir_list($arg, $cmd eq 'ls-l');
+        } elsif ($cmd eq 'cd') {
+            if (not chdir($arg)) {
+                print "cannot chdir $arg: $!\n";
+            }
+        } elsif ($cmd eq 'pwd') {
+            print Cwd::getcwd(), "\n";
+        } elsif ($cmd eq 'restore' or $cmd eq 'get') {
+            $arg = Cwd::abs_path($arg);
+            if (substr($arg, 0, length($backup_dir)) ne $backup_dir) {
+                print "$arg is not under $backup_dir\n";
+            } else {
+                my $suffix = substr($arg, length($backup_dir));
+                restore($arg, "$dest_dir/$suffix");
+            }
+        } elsif ($cmd eq '-v') {
+            ++$verbose;
+            print "verbose $verbose\n";
+        } elsif ($cmd eq '+v') {
+            --$verbose if $verbose > 0;
+            print "verbose $verbose\n";
+        } elsif ($cmd eq 'h' or $cmd eq '?' or $cmd eq 'help') {
+            print $interactive_help;
+        } else {
+            print "$cmd?\n";
+        }
+    }
+    close $tty;
+}
+
+# --------------------------------------------------------------------
+sub dir_list {
+    my ($dir, $long) = @_;
+    $dir = Cwd::getcwd() if not $dir;
+    my $d;
+    if (not opendir $d, $dir) {
+        print "cannot open dir $dir: $!\n";
+        return;
+    }
+    while (my $entry = readdir $d) {
+        next if $entry eq '.' or $entry eq '..';
+        my $file = "$dir/$entry";
+        if ($entry =~ /^\d{10}$/ and -f $file) {
+            print "B  $entry (",htime($entry,$long),")\n";
+        } else {
+            my $vers = versions($file);
+            my $ch = ($vers < 0) ? '? ' : ($vers == 0) ? 'd '  : sprintf('%-2d', $vers);
+            print "$ch $entry\n";
+        }
+    }
+    closedir $d;
+}
+
+# --------------------------------------------------------------------
+# >0 = arg is a file (leaf); return number of versions
+# 0 = arg is a dir
+# -1 = unrelated file or error
+sub versions {
+    my ($dir) = @_;
+    return -1 if not -d $dir;
+    my $d;
+    return -1 if not opendir $d, $dir;
+    my $vers = 0;
+    while (my $entry = readdir $d) {
+        ++$vers if $entry =~ /^\d{10}$/;
+    }
+    closedir $d;
+    return $vers;
 }
 
 # --------------------------------------------------------------------
@@ -49,6 +151,7 @@ sub restore {
         while (<FILES>) {
             chomp;
             my ($file, $version) = m|^(.*)\/([^/]+)/*$|;
+            print "check ($_) file $file, version $version\n" if $verbose > 1;
             next if not $file or not $version;
             if (defined $curr_file and $file ne $curr_file) {
                 # This is a new file. We've seen all versions of
@@ -83,7 +186,7 @@ sub restore_file {
     my $dest_dir = $dest_file;
     $dest_dir =~ s:/[^/]+$::; # remove the final (file) component
     my $cmd = "if [ -f ".quote($dest_dir)." ]; then rm -f ".quote($dest_dir)."; fi; mkdir -p ".quote($dest_dir)." && gunzip -c ".quote($backup_file)." > ".quote($dest_file);
-    print "EXEC   $cmd\n" if $verbose > 1;
+    print "EXEC   $cmd\n" if $verbose > 2;
     return 1 if $dryrun;
     return 0 if system($cmd) != 0;
     my ($dev,$ino,$mode) = stat($backup_file);
@@ -103,6 +206,8 @@ sub parse {
             return undef;
         } elsif ($arg eq '-f') {
             $force = 1;
+        } elsif ($arg eq '-i') {
+            $interactive = 1;
         } elsif ($arg eq '-n') {
             $dryrun = 1;
         } elsif ($arg eq '-v') {
@@ -114,9 +219,9 @@ sub parse {
             return undef;
         } else {
             if (not defined $args{backup_dir}) {
-                $args{backup_dir} = $arg;
+                $args{backup_dir} = Cwd::abs_path($arg);
             } elsif (not defined $args{dest}) {
-                $args{dest} = $arg;
+                $args{dest} = Cwd::abs_path($arg);
             } else {
                 print "ERROR  too many arguments\n";
                 return undef;
@@ -126,6 +231,13 @@ sub parse {
     return undef if not $args{dest};
     $args{excludes} = \@excludes;
     return \%args;
+}
+
+# --------------------------------------------------------------------
+sub htime {
+    my ($t) = @_;
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday) = gmtime($t);
+    return sprintf("%d/%d/%d@%02d:%02d", $year+1900, $mon+1, $mday, $hour, $min);
 }
 
 # --------------------------------------------------------------------
