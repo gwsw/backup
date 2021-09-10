@@ -8,7 +8,6 @@ usage: backup [-n] [-vXXX] [-k #] -r backup_root [dir [-x exclude]...]...
        -n = dry run
        -k = Keep # backup copies
        -v = verbose flags: b:backup, f:find, o:ok, c:copy, p:prune, s:summary, A:all
-       backup_root and dir must be absolute paths
        exclude is a directory name relative to dir
 _EOF_
 
@@ -156,8 +155,7 @@ sub parse {
         } elsif ($arg eq '-?') {
             return 0;
         } elsif ($arg eq '-r') {
-            $backup_root = shift @_;
-            return 0 if not absolute($backup_root);
+            $backup_root = Cwd::abs_path(shift @_);
             if (not -d $backup_root) {
                 print "ERROR root $backup_root does not exist\n";
                 return 0;
@@ -190,22 +188,17 @@ sub parse {
 sub add_dir {
     my $dir = shift @_;
     return 1 if not defined $dir;
-    return 0 if not absolute($dir);
+    if (not -d $dir) {
+        print "ERROR $dir is not a directory\n";
+        return 0;
+    }
+    $dir = Cwd::abs_path($dir);
     my %info;
     $info{dir} = $dir;
     my @excludes = @_;
     $info{excludes} = \@excludes;
     push @dir_infos, \%info;
     return 1;
-}
-
-# --------------------------------------------------------------------
-# Is a path absolute?
-sub absolute {
-    my ($path) = @_;
-    return 1 if $path =~ /^\//;
-    print "ERROR $path is not absolute\n";
-    return 0;
 }
 
 # --------------------------------------------------------------------

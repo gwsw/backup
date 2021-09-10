@@ -18,13 +18,14 @@ my $interactive_help =
     "ls[-l] [PATH]     List files and directories\n" .
     "cd PATH           Change working directory\n" .
     "pwd               Print working directory\n" .
-    "get PATH          Restore file. PATH is relative to backup_dir\n" .
+    "get PATH          Restore file.\n" .
     "[-+]v             Change verboseness\n";
 
 my $verbose = 0;
 my $dryrun = 0;
 my $force = 0;
 my $interactive = 0;
+my $stats;
 
 exit (main() ? 0 : 1);
 
@@ -46,14 +47,25 @@ sub interactive {
     my ($backup_dir, $dest_dir) = @_;
     chdir($backup_dir);
     print("chdir $backup_dir; now ",Cwd::getcwd(),"\n") if $verbose > 1;
+    my $term;
     my $tty;
-    if (not open $tty, "/dev/tty") {
-        print "cannot open tty: $!\n";
-        return;
+    if (eval "require Term::ReadLine::Tiny") {
+        $term = new Term::ReadLine::Tiny;
+    }
+    if (not $term) {
+        if (not open $tty, "/dev/tty") {
+            print "cannot open tty: $!\n";
+            return;
+        }
     }
     for (;;) {
-        print ">";
-        my $line = <$tty>;
+        my $line;
+        if ($term) {
+            $line = $term->readline(">");
+        } else {
+            print ">";
+            $line = <$tty>;
+        }
         chomp $line;
         my ($cmd, $arg) = $line =~ /^\s*([^\s]+)\s*(.*)/;
         if (not $cmd) {
@@ -61,6 +73,10 @@ sub interactive {
         } elsif ($cmd eq 'q' or $cmd eq 'quit' or $cmd eq 'exit') {
             last;
         } elsif ($cmd eq 'ls' or $cmd eq 'ls-l') {
+            if ($arg =~ /^\s*-l\s+(.*)/) {
+                $arg = $1;
+                $cmd = 'ls-l';
+            }
             dir_list($arg, $cmd eq 'ls-l');
         } elsif ($cmd eq 'cd') {
             if (not chdir($arg)) {
@@ -70,12 +86,24 @@ sub interactive {
             print Cwd::getcwd(), "\n";
         } elsif ($cmd eq 'restore' or $cmd eq 'get') {
             $arg = Cwd::abs_path($arg);
-            if (substr($arg, 0, length($backup_dir)) ne $backup_dir) {
+            if (not $arg) {
+                print $interactive_help;
+            } elsif (substr($arg, 0, length($backup_dir)) ne $backup_dir) {
                 print "$arg is not under $backup_dir\n";
             } else {
+                my %stats;
+                $stats = \%stats;
                 my $suffix = substr($arg, length($backup_dir));
                 restore($arg, "$dest_dir/$suffix");
+                $stats = undef;
+                print_stats(\%stats);
             }
+        } elsif ($cmd eq '-f') {
+            $force = 1;
+            print "force $force\n";
+        } elsif ($cmd eq '+f') {
+            $force = 0;
+            print "force $force\n";
         } elsif ($cmd eq '-v') {
             ++$verbose;
             print "verbose $verbose\n";
@@ -88,7 +116,7 @@ sub interactive {
             print "$cmd?\n";
         }
     }
-    close $tty;
+    close $tty if $tty;
 }
 
 # --------------------------------------------------------------------
@@ -132,9 +160,16 @@ sub versions {
 }
 
 # --------------------------------------------------------------------
+sub print_stats {
+    my ($stats) = @_;
+    printf "%d restored, %d skipped (-f to override), %d failed\n",
+        $stats->{ok}, $stats->{exists}, $stats->{fail};
+}
+
+# --------------------------------------------------------------------
 sub restore {
     my ($backup_dir, $dest_dir, $excludes) = @_;
-    print "RESTOR $backup_dir to $dest_dir\n" if $verbose;
+    print "RESTOR $backup_dir to $dest_dir\n" if $verbose > 1;
     my $ok = 1;
     my $latest_version = 0;
     my $curr_file;
@@ -143,15 +178,25 @@ sub restore {
     foreach my $exclude (@$excludes) {
         $find .= " -path ".quote($exclude)." -type d -prune -o";
     }
-    $find .= " -regex '.*/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' -print | sed ".quote('s|^'.$backup_dir.'/*||');
+    $find .= " -regex '.*/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' -print";
+    print "EXEC   $find\n" if $verbose > 1;
     if (not open FILES, "$find|") {
         print "ERROR  cannot execute \"$find\": $!\n";
         $ok = 0;
     } else {
         while (<FILES>) {
             chomp;
-            my ($file, $version) = m|^(.*)\/([^/]+)/*$|;
+            my ($file, $version) = m|^(.*)/([^/]+)/*$|;
             print "check ($_) file $file, version $version\n" if $verbose > 1;
+            if (substr($file,0,length($backup_dir)) ne $backup_dir) {
+                print "$file is not under $backup_dir ???\n";
+            } else {
+                $file = substr($file, length($backup_dir)+1);
+                if (length($file) == 0) {
+                    ($backup_dir,$file) = $backup_dir =~ m|^(.*)/([^/]+)/*$|;
+                    $dest_dir =~ s:/[^/]+$::;
+                }
+            }
             next if not $file or not $version;
             if (defined $curr_file and $file ne $curr_file) {
                 # This is a new file. We've seen all versions of
@@ -166,9 +211,9 @@ sub restore {
         # Restore the final file.
         $ok = 0 if $latest_version and not 
             restore_file($backup_dir, $dest_dir, $curr_file, $latest_version);
-        close FILES
+        close FILES;
     }
-    print "DONE   $backup_dir to $dest_dir\n" if $verbose;
+    print "DONE   $backup_dir to $dest_dir\n" if $verbose > 1;
     return $ok;
 }
 
@@ -179,19 +224,25 @@ sub restore_file {
     my $dest_file = "$dest_dir/$file";
     $dest_file =~ s/%(..)/chr(hex($1))/gex;
     if (not $force and -r $dest_file) {
-        print "SKIP   $dest_file\n" if $verbose > 1;
+        print "EXISTS $dest_file\n" if $verbose;
+        $stats->{exists}++;
         return 1;
     }
-    print "UNZIP  $dest_file\n" if $verbose == 1;
+    print "UNZIP  $dest_file\n" if $verbose;
     my $dest_dir = $dest_file;
     $dest_dir =~ s:/[^/]+$::; # remove the final (file) component
     my $cmd = "if [ -f ".quote($dest_dir)." ]; then rm -f ".quote($dest_dir)."; fi; mkdir -p ".quote($dest_dir)." && gunzip -c ".quote($backup_file)." > ".quote($dest_file);
     print "EXEC   $cmd\n" if $verbose > 2;
     return 1 if $dryrun;
-    return 0 if system($cmd) != 0;
+    if (system($cmd) != 0) {
+        $stats->{fail}++;
+        return 0 
+    }
     my ($dev,$ino,$mode) = stat($backup_file);
     chmod ($mode & 0777), $dest_file;
     utime $version, $version, $dest_file;
+    $stats->{ok}++;
+    return 1;
 }
 
 # --------------------------------------------------------------------
@@ -219,8 +270,13 @@ sub parse {
             return undef;
         } else {
             if (not defined $args{backup_dir}) {
+                if (not -d $arg) {
+                    print "ERROR  $arg is not a directory\n";
+                    return undef;
+                }
                 $args{backup_dir} = Cwd::abs_path($arg);
             } elsif (not defined $args{dest}) {
+                mkdir $arg if not -d $arg;
                 $args{dest} = Cwd::abs_path($arg);
             } else {
                 print "ERROR  too many arguments\n";
